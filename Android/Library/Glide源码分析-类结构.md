@@ -1,6 +1,6 @@
 ### Glide源码分析-框架类分析
 
-Glide是一个用来加载图片的三方库，它内部的实现逻辑非常复杂，类之间的关系错综复杂，如果一开始就扎进源码去分析它的实现将非常困难。所以在正式阅读源码之前，我们先从设计层面来一步一步分析Glide的整体框架类，以及设计这些类背后的目的。这对于我们后续分析具体实现将会大有裨益，另一方面，我们还会从全局的角度来思考Glide的设计思想。
+Glide是一个用来加载图片的三方库，它内部的实现逻辑非常复杂，类之间的关系错综复杂，如果一开始就扎进源码去分析它的实现将非常困难。所以在正式阅读源码之前，我们先从设计层面来分析下Glide的整体框架类，以及设计这些类背后的目的。这对于我们后续分析具体实现将会大有裨益，另一方面，我们还会从全局的角度来思考Glide的设计思想。
 
 #### 类及接口分析
 
@@ -54,6 +54,23 @@ public interface Resource<Z> {
 ```
 
 主要子类如BitmapResource，BytesResource,DrawableResource等
+
+#### ResourceTranscoder
+
+ResourceTranscoder负责对资源进行转换，比如将Resource<Bitmap> 转为 Resource<BitmapDrawable>
+
+```java
+public interface ResourceTranscoder<Z, R> {
+
+  /**
+   * Transcodes the given resource to the new resource type and returns the new resource.
+   *
+   * @param toTranscode The resource to transcode.
+   */
+  @Nullable
+  Resource<R> transcode(@NonNull Resource<Z> toTranscode, @NonNull Options options);
+}
+```
 
 #### Key
 
@@ -314,7 +331,7 @@ BitmapEncoder的实现很简单，就是对Bitmap资源进行质量压缩后，�
 
 #### ResourceDecoder
 
-ResourceDecoder是一个将对资源源中decode一个Resource，资源的源可以是File，InputStream等。
+ResourceDecoder是一个可以将资源源中decode出一个Resource的接口，资源的源可以是File，InputStream等。
 
 ```java
 /**
@@ -331,7 +348,7 @@ public interface ResourceDecoder<T, Z> {
 }
 ```
 
-它也有众多的实现类，比如StreamBitmapDecoder从流中读取到Bitmap,StreamGifDecoder从流中读取GifDrawable，ResourceDrawableDecoder从Uri中读取到Drawable等。这里我们看看StreamBitmapDecoder的简单实现
+ResourceDecorder的模板类型T代表了可以进行decode的资源源类型，它可以是File,InputStream等，类型Z是通过decode拿到的Resource资源类型。即可以是Bitmap，Drawable等，它也有众多的实现类，比如StreamBitmapDecoder从流中读取到Bitmap,StreamGifDecoder从流中读取GifDrawable，ResourceDrawableDecoder从Uri中读取到Drawable等。这里我们看看StreamBitmapDecoder的简单实现
 
 ```java
 public class StreamBitmapDecoder implements ResourceDecoder<InputStream, Bitmap> {
@@ -370,8 +387,6 @@ public class StreamBitmapDecoder implements ResourceDecoder<InputStream, Bitmap>
 ```
 
 StreamBitmapDecoder的decode方法简单对source流做封装处理后，交给Downsampler，Downsampler负责专门从流中解析出Bitmap对象然后返回。
-
-
 
 #### DataFetcher
 
@@ -456,9 +471,84 @@ public class HttpUrlFetcher implements DataFetcher<InputStream> {
 
 HttpUrlFetcher负责从网络加载资源，它返回一个InputStream. 可以看到，Glide内部使用的网络请求库是HttpUrlConnection.
 
+#### ModelLoader
+
+ModelLoader可以将各种复杂的数据模型转换成一种聚合类型，这个聚合类型数据可以通过DataFetcher来获取。这个接口有两个目标：
+
+**1) 转换具体的Model类型为一个可以加载出资源对象的类型Data**
+
+**2) 允许这个Model类型结合view的尺寸去加载指定大小的资源**
+
+简单来说，ModelLoader将我们配置的请求加载类型，比如String,File等转换成可以通过DataFetcher来获取的类型。所以它和DataFetcher紧密相关。
+
+```java
+public interface ModelLoader<Model, Data> {
+    
+    class LoadData<Data> {
+        public final Key sourceKey;
+        public final List<Key> alternateKeys;
+        public final DataFetcher<Data> fetcher;
+
+        public LoadData(@NonNull Key sourceKey, @NonNull DataFetcher<Data> fetcher) {
+          this(sourceKey, Collections.<Key>emptyList(), fetcher);
+        }
+
+        public LoadData(@NonNull Key sourceKey, @NonNull List<Key> alternateKeys,
+            @NonNull DataFetcher<Data> fetcher) {
+          this.sourceKey = Preconditions.checkNotNull(sourceKey);
+          this.alternateKeys = Preconditions.checkNotNull(alternateKeys);
+          this.fetcher = Preconditions.checkNotNull(fetcher);
+        }
+    }
+    
+  	@Nullable
+  	LoadData<Data> buildLoadData(@NonNull Model model, int width, int height,
+      @NonNull Options options);
+    
+    boolean handles(@NonNull Model model);
+}
+```
+
+类型Model代表的是需要转换的复杂数据类型，Data是可以通过DataFetcher加载资源的类型。同时，ModelLoader内部有一类LoadData，它根据Data类型封装了DataFetcher，而LoadData它是通过buildLoadData返回的。
+
+DataLoader也有很多子类，比如HttpGlideUrlLoader,UriLoader,FileLoader,ByteBufferLoader等等。这里我们看HttpGlideUrlLoader的实现
+
+```java
+public class HttpGlideUrlLoader implements ModelLoader<GlideUrl, InputStream> {
+  ...
+  @Override
+  public LoadData<InputStream> buildLoadData(@NonNull GlideUrl model, int width, int height,
+      @NonNull Options options) {
+    // GlideUrls memoize parsed URLs so caching them saves a few object instantiations and time
+    // spent parsing urls.
+    GlideUrl url = model;
+    ...
+    return new LoadData<>(url, new HttpUrlFetcher(url, timeout));
+  }
+
+  @Override
+  public boolean handles(@NonNull GlideUrl model) {
+    return true;
+  }
+    
+  public static class Factory implements ModelLoaderFactory<GlideUrl, InputStream> {
+    private final ModelCache<GlideUrl, GlideUrl> modelCache = new ModelCache<>(500);
+
+    @NonNull
+    @Override
+    public ModelLoader<GlideUrl, InputStream> build(MultiModelLoaderFactory multiFactory) {
+      return new HttpGlideUrlLoader(modelCache);
+    }
+    ...
+  }
+}
+```
+
+HttpGlideUrlLoader的model类型为GlideUrl,data类型为InputStream,前者是Glide对于普通的url进行了封装，后者可以通过DataLoader内部的DataFetcher获取到，然后交给ResourceDecoder解析出具体的资源类型。可以看到buildLoadData内部它通过HttpUrlFetcher来构造LoadData，这个HttpUrlFetcher就是一个DataFetcher，它被封装在LoadData中以备使用。
+
 #### Transformation
 
-Transformation即转换，可以对于某一种资源进行转换处理，转换前后的类型一致。
+Transformation即转换，可以对于某一种资源进行转换处理，转换前后的类型一致。这个我们比较熟悉，比如我们需要将一个普通的矩形图片转换成带圆角的或者圆形的图片就需要为Glide配置对应的Transformation，它负责来处理这种转换。
 
 ```java
 public interface Transformation<T> extends Key {
@@ -471,5 +561,33 @@ public interface Transformation<T> extends Key {
 }
 ```
 
+它的子类有DrawableTransformation，BitmapTransformation，MultiTransformation，其中MultiTransformation比较特殊，它会经过多个Transformation来进行转换，我们看看它的实现
+
+```java
+public class MultiTransformation<T> implements Transformation<T> {
+  	private final Collection<? extends Transformation<T>> transformations;
+    public MultiTransformation(@NonNull Collection<? extends Transformation<T>> transformationList) {
+    	this.transformations = transformationList;
+  	}
+    ...
+    public Resource<T> transform(
+      @NonNull Context context, @NonNull Resource<T> resource, int outWidth, int outHeight) {
+        Resource<T> previous = resource;
+
+        for (Transformation<T> transformation : transformations) {
+          Resource<T> transformed = transformation.transform(context, previous, outWidth, outHeight);
+          if (previous != null && !previous.equals(resource) && !previous.equals(transformed)) {
+            previous.recycle();
+          }
+          previous = transformed;
+        }
+        return previous;
+    }
+}
+```
+
+能够进行多次转换是因为它内部有一个Transformation集合，在transform时通过每个Transformation进行处理就达到了多次转换的目的。
 
 
+
+经过以上的分析，我们大概对于Glide有了一些整体的了解。比如资源的形式会是以Resouce来体现，资源会通过Encoder或者Decoder来进行序列化处理。资源源数据会通过DataFetcher来获取，ModelLoader负责将模型类型转换成一个DataFetcher，Transformation会对资源做一系列的转换。最终资源会和一个Target关联，用来显示或者获取到最终处理后的资源。清楚了以上的内容，我们再来分析根据这个主线去分析Glide的源码相对来说会容易很多。
